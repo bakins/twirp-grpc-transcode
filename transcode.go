@@ -18,7 +18,6 @@ import (
 	"github.com/jhump/protoreflect/dynamic"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 type Handler struct {
@@ -114,29 +113,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		st := status.New(codes.Internal, fmt.Sprintf("failed to read request %s", err.Error()))
-		h.writeError(w, st)
+		st := spb.Status{
+			Code:    int32(codes.Internal),
+			Message: fmt.Sprintf("failed to read request %s", err.Error()),
+		}
+		h.writeError(w, &st)
 		return
 	}
 
 	if isJson {
 		m, ok := h.methods[r.URL.Path]
 		if !ok {
-			st := status.New(
-				codes.Unimplemented,
-				fmt.Sprintf("transcoding not availible for %s", r.URL.Path),
-			)
-			h.writeError(w, st)
+			st := spb.Status{
+				Code:    int32(codes.Unimplemented),
+				Message: fmt.Sprintf("transcoding not availible for %s", r.URL.Path),
+			}
+			h.writeError(w, &st)
 			return
 		}
 
 		p, err := h.jsonToProto(m.input, data)
 		if err != nil {
-			st := status.New(
-				codes.InvalidArgument,
-				fmt.Sprintf("the request could not be decoded %s", err.Error()),
-			)
-			h.writeError(w, st)
+			st := spb.Status{
+				Code:    int32(codes.InvalidArgument),
+				Message: fmt.Sprintf("the request could not be decoded %s", err.Error()),
+			}
+			h.writeError(w, &st)
 			return
 		}
 
@@ -156,45 +158,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.next.ServeHTTP(capture, r)
 
 	if statusCode := capture.getStatus(); statusCode != http.StatusOK {
-		st := status.New(
-			codes.Internal,
-			fmt.Sprintf("error from intermediary with HTTP status code %d", statusCode),
-		)
-		h.writeError(w, st)
+		st := spb.Status{
+			Code:    int32(codes.Internal),
+			Message: fmt.Sprintf("error from intermediary with HTTP status code %d", statusCode),
+		}
+		h.writeError(w, &st)
 		return
 	}
 
 	if contentType := strings.ToLower(capture.headers.Get("Content-Type")); !strings.HasPrefix(contentType, "application/grpc") {
-		st := status.New(
-			codes.Internal,
-			fmt.Sprintf("unexpected content-type returned %s", contentType),
-		)
-		h.writeError(w, st)
+		st := spb.Status{
+			Code:    int32(codes.Internal),
+			Message: fmt.Sprintf("unexpected content-type returned %s", contentType),
+		}
+		h.writeError(w, &st)
 		return
 	}
 
 	grpcStatus, err := getGrpcStatus(capture.headers)
 	if err != nil {
-		st := status.New(
-			codes.Internal,
-			fmt.Sprintf("failed to get grpc-status %s", err.Error()),
-		)
-		h.writeError(w, st)
+		st := spb.Status{
+			Code:    int32(codes.Internal),
+			Message: fmt.Sprintf("failed to get grpc-status %s", err.Error()),
+		}
+		h.writeError(w, &st)
 		return
 	}
 
-	if grpcStatus.Code() != codes.OK {
+	if codes.Code(grpcStatus.Code) != 0 {
 		h.writeError(w, grpcStatus)
 		return
 	}
 
 	output, err := removeFraming(&capture.body)
 	if err != nil {
-		st := status.New(
-			codes.Internal,
-			fmt.Sprintf("failed to remove grpc message framing %s", err.Error()),
-		)
-		h.writeError(w, st)
+		st := spb.Status{
+			Code:    int32(codes.Internal),
+			Message: fmt.Sprintf("failed to remove grpc message framing %s", err.Error()),
+		}
+		h.writeError(w, &st)
 		return
 	}
 
@@ -202,21 +204,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// we already checked above
 		m, ok := h.methods[r.URL.Path]
 		if !ok {
-			st := status.New(
-				codes.Unimplemented,
-				fmt.Sprintf("transcoding not availible for %s", r.URL.Path),
-			)
-			h.writeError(w, st)
+			st := spb.Status{
+				Code:    int32(codes.Unimplemented),
+				Message: fmt.Sprintf("transcoding not availible for %s", r.URL.Path),
+			}
+			h.writeError(w, &st)
 			return
 		}
 
 		j, err := h.protoToJson(m.output, output)
 		if err != nil {
-			st := status.New(
-				codes.Internal,
-				fmt.Sprintf("failed to decode response %s", err.Error()),
-			)
-			h.writeError(w, st)
+			st := spb.Status{
+				Code:    int32(codes.Internal),
+				Message: fmt.Sprintf("failed to decode response %s", err.Error()),
+			}
+			h.writeError(w, &st)
 			return
 		}
 
@@ -244,8 +246,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // based on twirp's mapping:
-func grpcToStatusCode(code codes.Code) int {
-	switch code {
+func grpcToStatusCode(code int32) int {
+	switch codes.Code(code) {
 	case codes.Canceled:
 		return 408 // RequestTimeout
 	case codes.Unknown:
@@ -285,7 +287,7 @@ func grpcToStatusCode(code codes.Code) int {
 	}
 }
 
-func getGrpcStatus(headers http.Header) (*status.Status, error) {
+func getGrpcStatus(headers http.Header) (*spb.Status, error) {
 	gs := headers.Get("Grpc-Status")
 	if gs == "" {
 		// assume ok - is this reasonable?
@@ -297,45 +299,38 @@ func getGrpcStatus(headers http.Header) (*status.Status, error) {
 		return nil, fmt.Errorf("invalid grpc-status found %s", gs)
 	}
 
-	code := codes.Code(num)
-
 	msg := headers.Get("Grpc-Message")
 	if msg != "" {
 		msg = decodeGrpcMessage(msg)
 	} else {
-		msg = code.String()
+		msg = codes.Code(num).String()
 	}
 
-	// TODO: handled detailed-bin status
+	s := spb.Status{
+		Code:    int32(num),
+		Message: msg,
+	}
 
 	details := headers.Get("Grpc-Status-Details-Bin")
 	if details == "" {
-		return status.New(code, msg), nil
+		return &s, nil
 	}
 
 	data, err := decodeBinHeader(details)
 	if err != nil {
 		// return what we have
-		return status.New(code, msg), nil
+		return &s, nil
 	}
 
 	var statusProto spb.Status
 	if err := proto.Unmarshal(data, &statusProto); err != nil {
 		// return what we have
-		return status.New(code, msg), nil
+		return &s, nil
 	}
 
-	if len(statusProto.Details) == 0 {
-		return status.New(code, msg), nil
-	}
+	s.Details = statusProto.Details
 
-	s := spb.Status{
-		Code:    int32(code),
-		Message: msg,
-		Details: statusProto.Details,
-	}
-
-	return status.FromProto(&s), nil
+	return &s, nil
 }
 
 func decodeBinHeader(v string) ([]byte, error) {
@@ -496,25 +491,23 @@ func (h *Handler) protoToJson(m *desc.MessageDescriptor, data []byte) ([]byte, e
 	return buf.Bytes(), nil
 }
 
-func (h *Handler) writeError(w http.ResponseWriter, st *status.Status) {
+func (h *Handler) writeError(w http.ResponseWriter, st *spb.Status) {
 	respBody := h.marshalErrorToJSON(st)
 
 	w.Header().Set("Content-Type", "application/json") // Error responses are always JSON
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 
-	statusCode := grpcToStatusCode(st.Code())
+	statusCode := grpcToStatusCode(st.Code)
 
 	w.WriteHeader(statusCode) // set HTTP status code and send response
 
 	_, _ = w.Write(respBody)
 }
 
-func (h *Handler) marshalErrorToJSON(st *status.Status) []byte {
+func (h *Handler) marshalErrorToJSON(st *spb.Status) []byte {
 	var buf bytes.Buffer
 
-	// fmt.Println(st.Proto())
-
-	if err := h.marshaler.Marshal(&buf, st.Proto()); err != nil {
+	if err := h.marshaler.Marshal(&buf, st); err != nil {
 		// internal error
 		return []byte(`{"code": 13, "message": "There was an error but it could not be serialized into JSON"}`)
 	}
