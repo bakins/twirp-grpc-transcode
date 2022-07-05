@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -16,6 +17,7 @@ import (
 	dpb "github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
+	"github.com/twitchtv/twirp"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 )
@@ -113,32 +115,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		st := spb.Status{
-			Code:    int32(codes.Internal),
-			Message: fmt.Sprintf("failed to read request %s", err.Error()),
-		}
-		h.writeError(w, &st)
+		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to read request %w", err))
+		h.writeError(w, twerr)
 		return
 	}
 
+	path := strings.TrimPrefix(r.URL.Path, "/twirp")
+
 	if isJson {
-		m, ok := h.methods[r.URL.Path]
+		m, ok := h.methods[path]
 		if !ok {
-			st := spb.Status{
-				Code:    int32(codes.Unimplemented),
-				Message: fmt.Sprintf("transcoding not availible for %s", r.URL.Path),
-			}
-			h.writeError(w, &st)
+			twerr := twirp.Unimplemented.Errorf("transcoding not availible for %s", r.URL.Path)
+			h.writeError(w, twerr)
 			return
 		}
 
 		p, err := h.jsonToProto(m.input, data)
 		if err != nil {
-			st := spb.Status{
-				Code:    int32(codes.InvalidArgument),
-				Message: fmt.Sprintf("the request could not be decoded %s", err.Error()),
-			}
-			h.writeError(w, &st)
+			twerr := twirp.InvalidArgument.Errorf("the request could not be decoded %s", err.Error())
+			h.writeError(w, twerr)
 			return
 		}
 
@@ -148,6 +143,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	data = addFraming(data)
 
 	r = r.Clone(r.Context())
+	r.URL.Path = path
+	r.ProtoMajor = 2
+	r.ProtoMinor = 0
 	r.ContentLength = int64(len(data))
 	r.Header.Del("Content-Length")
 	r.Header.Set("Content-Type", "application/grpc")
@@ -158,67 +156,51 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.next.ServeHTTP(capture, r)
 
 	if statusCode := capture.getStatus(); statusCode != http.StatusOK {
-		st := spb.Status{
-			Code:    int32(codes.Internal),
-			Message: fmt.Sprintf("error from intermediary with HTTP status code %d", statusCode),
-		}
-		h.writeError(w, &st)
+		fmt.Println(capture.body.String())
+		twerr := twirp.Internal.Errorf("error from intermediary with HTTP status code %d", statusCode)
+		h.writeError(w, twerr)
 		return
 	}
 
 	if contentType := strings.ToLower(capture.headers.Get("Content-Type")); !strings.HasPrefix(contentType, "application/grpc") {
-		st := spb.Status{
-			Code:    int32(codes.Internal),
-			Message: fmt.Sprintf("unexpected content-type returned %s", contentType),
-		}
-		h.writeError(w, &st)
+		twerr := twirp.Internal.Errorf("unexpected content-type returned %s", contentType)
+		h.writeError(w, twerr)
 		return
 	}
 
 	grpcStatus, err := getGrpcStatus(capture.headers)
 	if err != nil {
-		st := spb.Status{
-			Code:    int32(codes.Internal),
-			Message: fmt.Sprintf("failed to get grpc-status %s", err.Error()),
-		}
-		h.writeError(w, &st)
+		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to get grpc-status %w", err))
+		h.writeError(w, twerr)
 		return
 	}
 
 	if codes.Code(grpcStatus.Code) != 0 {
-		h.writeError(w, grpcStatus)
+		twerr := grpcStatusToTwirp(grpcStatus)
+		h.writeError(w, twerr)
 		return
 	}
 
 	output, err := removeFraming(&capture.body)
 	if err != nil {
-		st := spb.Status{
-			Code:    int32(codes.Internal),
-			Message: fmt.Sprintf("failed to remove grpc message framing %s", err.Error()),
-		}
-		h.writeError(w, &st)
+		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to remove grpc message framing %w", err))
+		h.writeError(w, twerr)
 		return
 	}
 
 	if isJson {
 		// we already checked above
-		m, ok := h.methods[r.URL.Path]
+		m, ok := h.methods[path]
 		if !ok {
-			st := spb.Status{
-				Code:    int32(codes.Unimplemented),
-				Message: fmt.Sprintf("transcoding not availible for %s", r.URL.Path),
-			}
-			h.writeError(w, &st)
+			twerr := twirp.Unimplemented.Errorf("transcoding not availible for %s", r.URL.Path)
+			h.writeError(w, twerr)
 			return
 		}
 
 		j, err := h.protoToJson(m.output, output)
 		if err != nil {
-			st := spb.Status{
-				Code:    int32(codes.Internal),
-				Message: fmt.Sprintf("failed to decode response %s", err.Error()),
-			}
-			h.writeError(w, &st)
+			twerr := twirp.InternalErrorWith(fmt.Errorf("failed to decode response %w", err))
+			h.writeError(w, twerr)
 			return
 		}
 
@@ -245,46 +227,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(output)
 }
 
-// based on twirp's mapping:
-func grpcToStatusCode(code int32) int {
-	switch codes.Code(code) {
+func grpcStatusToTwirp(st *spb.Status) twirp.Error {
+	code := twirp.NoError
+	switch codes.Code(st.Code) {
 	case codes.Canceled:
-		return 408 // RequestTimeout
+		code = twirp.Canceled
 	case codes.Unknown:
-		return 500 // Internal Server Error
+		code = twirp.Unknown
 	case codes.InvalidArgument:
-		return 400 // BadRequest
+		code = twirp.InvalidArgument
 	case codes.DeadlineExceeded:
-		return 408 // RequestTimeout
+		code = twirp.DeadlineExceeded
 	case codes.NotFound:
-		return 404 // Not Found
+		code = twirp.NotFound
 	case codes.AlreadyExists:
-		return 409 // Conflict
+		code = twirp.AlreadyExists
 	case codes.PermissionDenied:
-		return 403 // Forbidden
+		code = twirp.PermissionDenied
 	case codes.Unauthenticated:
-		return 401 // Unauthorized
+		code = twirp.Unauthenticated
 	case codes.ResourceExhausted:
-		return 429 // Too Many Requests
+		code = twirp.ResourceExhausted
 	case codes.FailedPrecondition:
-		return 412 // Precondition Failed
+		code = twirp.FailedPrecondition
 	case codes.Aborted:
-		return 409 // Conflict
+		code = twirp.Aborted
 	case codes.OutOfRange:
-		return 400 // Bad Request
+		code = twirp.OutOfRange
 	case codes.Unimplemented:
-		return 501 // Not Implemented
+		code = twirp.Unimplemented
 	case codes.Internal:
-		return 500 // Internal Server Error
+		code = twirp.Internal
 	case codes.Unavailable:
-		return 503 // Service Unavailable
+		code = twirp.Unavailable
 	case codes.DataLoss:
-		return 500 // Internal Server Error
-	case codes.OK:
-		return 200 // OK
+		code = twirp.DataLoss
 	default:
-		return 500 // Invalid! set to internal
+		code = twirp.Internal
 	}
+
+	msg := st.Message
+
+	if msg == "" {
+		msg = codes.Code(st.Code).String()
+	}
+
+	twerr := twirp.NewError(code, msg).WithMeta("status", strconv.Itoa(int(st.Code)))
+
+	// TODO: include any details
+
+	return twerr
 }
 
 func getGrpcStatus(headers http.Header) (*spb.Status, error) {
@@ -491,26 +483,41 @@ func (h *Handler) protoToJson(m *desc.MessageDescriptor, data []byte) ([]byte, e
 	return buf.Bytes(), nil
 }
 
-func (h *Handler) writeError(w http.ResponseWriter, st *spb.Status) {
-	respBody := h.marshalErrorToJSON(st)
+func (h *Handler) writeError(w http.ResponseWriter, twerr twirp.Error) {
+	respBody := h.marshalErrorToJSON(twerr)
 
 	w.Header().Set("Content-Type", "application/json") // Error responses are always JSON
 	w.Header().Set("Content-Length", strconv.Itoa(len(respBody)))
 
-	statusCode := grpcToStatusCode(st.Code)
+	statusCode := twirp.ServerHTTPStatusFromErrorCode(twerr.Code())
 
 	w.WriteHeader(statusCode) // set HTTP status code and send response
 
 	_, _ = w.Write(respBody)
 }
 
-func (h *Handler) marshalErrorToJSON(st *spb.Status) []byte {
-	var buf bytes.Buffer
+type twerrJSON struct {
+	Meta map[string]string `json:"meta,omitempty"`
+	Code string            `json:"code"`
+	Msg  string            `json:"msg"`
+}
 
-	if err := h.marshaler.Marshal(&buf, st); err != nil {
-		// internal error
-		return []byte(`{"code": 13, "message": "There was an error but it could not be serialized into JSON"}`)
+func (h *Handler) marshalErrorToJSON(twerr twirp.Error) []byte {
+	msg := twerr.Msg()
+	if len(msg) > 1e6 {
+		msg = msg[:1e6]
 	}
 
-	return buf.Bytes()
+	tj := twerrJSON{
+		Code: string(twerr.Code()),
+		Msg:  msg,
+		Meta: twerr.MetaMap(),
+	}
+
+	buf, err := json.Marshal(&tj)
+	if err != nil {
+		buf = []byte("{\"type\": \"" + twirp.Internal + "\", \"msg\": \"There was an error but it could not be serialized into JSON\"}") // fallback
+	}
+
+	return buf
 }
