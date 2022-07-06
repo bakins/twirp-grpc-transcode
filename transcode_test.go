@@ -22,7 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	pb "github.com/bakins/grpc-twirp-transcode/testdata"
+	pb "github.com/bakins/twirp-grpc-transcode/testdata"
 )
 
 // to recreate descriptor set, cd to testdata and run
