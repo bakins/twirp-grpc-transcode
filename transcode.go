@@ -11,27 +11,30 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	dpb "github.com/golang/protobuf/protoc-gen-go/descriptor"
-	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	"github.com/twitchtv/twirp"
-	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 type Handler struct {
 	next        http.Handler
+	registry    *protoregistry.Files
 	factory     *dynamic.MessageFactory
 	methods     map[string]*rpcMethod
-	marshaler   *jsonpb.Marshaler
-	unmarshaler *jsonpb.Unmarshaler
+	marshaler   protojson.MarshalOptions
+	unmarshaler protojson.UnmarshalOptions
 }
 
 type rpcMethod struct {
-	input  *desc.MessageDescriptor
-	output *desc.MessageDescriptor
+	input  protoreflect.MessageType
+	output protoreflect.MessageType
 }
 
 func New(filename string, next http.Handler) (*Handler, error) {
@@ -40,60 +43,46 @@ func New(filename string, next http.Handler) (*Handler, error) {
 		return nil, err
 	}
 
-	var fds dpb.FileDescriptorSet
+	var fds descriptorpb.FileDescriptorSet
 
 	if err := proto.Unmarshal(data, &fds); err != nil {
 		return nil, err
 	}
 
-	descriptors, err := desc.CreateFileDescriptorsFromSet(&fds)
+	files, err := protodesc.NewFiles(&fds)
 	if err != nil {
 		return nil, err
 	}
 
-	registry := dynamic.NewKnownTypeRegistryWithDefaults()
-	ext := dynamic.NewExtensionRegistryWithDefaults()
-
 	h := Handler{
-		methods: make(map[string]*rpcMethod),
-		factory: dynamic.NewMessageFactoryWithRegistries(ext, registry),
-		next:    next,
+		registry: files,
+		next:     next,
+		methods:  make(map[string]*rpcMethod),
 	}
 
-	var resolverDesc []*desc.FileDescriptor
+	files.RangeFiles(func(d protoreflect.FileDescriptor) bool {
+		services := d.Services()
+		for i := 0; i < services.Len(); i++ {
+			s := services.Get(i)
 
-	// ensure status is added so we can (un)marshal for details
-	registry.AddKnownType(&spb.Status{})
+			methods := s.Methods()
 
-	for _, d := range descriptors {
-		resolverDesc = append(resolverDesc, d)
+			for j := 0; j < methods.Len(); j++ {
+				m := methods.Get(j)
 
-		for _, s := range d.GetServices() {
-			for _, m := range s.GetMethods() {
-				registry.AddKnownType(m.GetInputType().AsProto(), m.GetOutputType().AsProto())
-
-				// full http post path
-				key := "/" + d.GetPackage() + "." + s.GetName() + "/" + m.GetName()
-
-				r := rpcMethod{
-					input:  m.GetInputType(),
-					output: m.GetOutputType(),
+				rm := rpcMethod{
+					input:  dynamicpb.NewMessage(m.Input()).Type(),
+					output: dynamicpb.NewMessage(m.Output()).Type(),
 				}
 
-				h.methods[key] = &r
+				key := "/" + string(s.FullName()) + "/" + string(m.Name())
+
+				h.methods[key] = &rm
 			}
 		}
-	}
 
-	resolver := dynamic.AnyResolver(h.factory, resolverDesc...)
-
-	h.marshaler = &jsonpb.Marshaler{
-		AnyResolver: resolver,
-	}
-
-	h.unmarshaler = &jsonpb.Unmarshaler{
-		AnyResolver: resolver,
-	}
+		return true
+	})
 
 	return &h, nil
 }
@@ -421,30 +410,24 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	w.status = statusCode
 }
 
-func (h *Handler) jsonToProto(m *desc.MessageDescriptor, data []byte) ([]byte, error) {
-	msg := h.factory.NewMessage(m)
+func (h *Handler) jsonToProto(t protoreflect.MessageType, data []byte) ([]byte, error) {
+	msg := t.New().Interface()
 
-	if err := h.unmarshaler.Unmarshal(bytes.NewReader(data), msg); err != nil {
+	if err := h.unmarshaler.Unmarshal(data, msg); err != nil {
 		return nil, err
 	}
 
 	return proto.Marshal(msg)
 }
 
-func (h *Handler) protoToJson(m *desc.MessageDescriptor, data []byte) ([]byte, error) {
-	msg := h.factory.NewMessage(m)
+func (h *Handler) protoToJson(t protoreflect.MessageType, data []byte) ([]byte, error) {
+	msg := t.New().Interface()
 
 	if err := proto.Unmarshal(data, msg); err != nil {
 		return nil, err
 	}
 
-	var buf bytes.Buffer
-
-	if err := h.marshaler.Marshal(&buf, msg); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	return h.marshaler.Marshal(msg)
 }
 
 func (h *Handler) writeError(w http.ResponseWriter, twerr twirp.Error) {

@@ -47,9 +47,9 @@ func TestHandler(t *testing.T) {
 
 		client := pb.NewGreeterClient(conn)
 
-		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "world"})
+		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: t.Name()})
 		require.NoError(t, err)
-		require.Equal(t, "hello world", resp.Message)
+		require.Equal(t, "hello "+t.Name(), resp.Message)
 
 		_, err = client.SayHello(context.Background(), &pb.HelloRequest{Name: "universe"})
 		require.Error(t, err)
@@ -71,10 +71,10 @@ func TestHandler(t *testing.T) {
 	t.Run("protobuf request", func(t *testing.T) {
 		client := pb.NewGreeterProtobufClient(svr.URL, http.DefaultClient)
 
-		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "world"})
+		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: t.Name()})
 		require.NoError(t, err)
 
-		require.Equal(t, "hello world", resp.Message)
+		require.Equal(t, "hello "+t.Name(), resp.Message)
 	})
 
 	t.Run("protobuf error", func(t *testing.T) {
@@ -111,10 +111,10 @@ func TestHandler(t *testing.T) {
 	t.Run("json request", func(t *testing.T) {
 		client := pb.NewGreeterJSONClient(svr.URL, http.DefaultClient)
 
-		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "world"})
+		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: t.Name()})
 		require.NoError(t, err)
 
-		require.Equal(t, "hello world", resp.Message)
+		require.Equal(t, "hello "+t.Name(), resp.Message)
 	})
 
 	t.Run("json error", func(t *testing.T) {

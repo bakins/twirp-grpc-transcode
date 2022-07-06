@@ -3,7 +3,6 @@ module github.com/bakins/grpc-twirp-transcode
 go 1.18
 
 require (
-	github.com/golang/protobuf v1.5.2
 	github.com/jhump/protoreflect v1.12.0
 	github.com/stretchr/testify v1.7.0
 	github.com/twitchtv/twirp v8.1.2+incompatible
@@ -15,6 +14,7 @@ require (
 
 require (
 	github.com/davecgh/go-spew v1.1.0 // indirect
+	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	golang.org/x/sys v0.0.0-20220615213510-4f61da869c0c // indirect
