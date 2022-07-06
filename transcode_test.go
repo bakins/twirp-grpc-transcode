@@ -2,6 +2,7 @@ package transcode
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -9,13 +10,17 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/twitchtv/twirp"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	pb "github.com/bakins/grpc-twirp-transcode/testdata"
 )
@@ -62,84 +67,46 @@ func TestHandler(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, "42", info.RequestId)
 	})
-	/*
-		t.Run("protobuf request", func(t *testing.T) {
-			client := &http.Client{
-				Transport: &http2.Transport{
-					AllowHTTP: true,
-					DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-						return net.Dial(network, addr)
-					},
-				},
-			}
 
-			data, err := proto.Marshal(&pb.HelloRequest{Name: "world"})
-			require.NoError(t, err)
+	t.Run("protobuf request", func(t *testing.T) {
+		client := pb.NewGreeterProtobufClient(svr.URL, http.DefaultClient)
 
-			req, err := http.NewRequest(http.MethodPost, svr.URL+"/helloworld.Greeter/SayHello", bytes.NewReader(data))
-			require.NoError(t, err)
-			req.Header.Set("Content-Type", "application/protobuf")
+		resp, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "world"})
+		require.NoError(t, err)
 
-			resp, err := client.Do(req)
-			require.NoError(t, err)
+		require.Equal(t, "hello world", resp.Message)
+	})
 
-			defer resp.Body.Close()
+	t.Run("protobuf error", func(t *testing.T) {
+		client := pb.NewGreeterProtobufClient(svr.URL, http.DefaultClient)
 
-			data, err = ioutil.ReadAll(resp.Body)
-			require.NoError(t, err)
+		_, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "universe"})
+		require.Error(t, err)
 
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-			require.Equal(t, "application/protobuf", resp.Header.Get("Content-Type"))
+		twerr, ok := err.(twirp.Error)
+		require.True(t, ok)
 
-			var reply pb.HelloReply
-			err = proto.Unmarshal(data, &reply)
-			require.NoError(t, err)
-			require.Equal(t, "hello world", reply.Message)
-		})
+		require.Equal(t, twirp.FailedPrecondition, twerr.Code())
 
-		t.Run("protobuf error", func(t *testing.T) {
-			client := &http.Client{
-				Transport: &http2.Transport{
-					AllowHTTP: true,
-					DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-						return net.Dial(network, addr)
-					},
-				},
-			}
+		details := twerr.Meta("grpc-status-details-bin")
+		require.NotEmpty(t, details)
 
-			data, err := proto.Marshal(&pb.HelloRequest{Name: "universe"})
-			require.NoError(t, err)
+		data, err := decodeBinHeader(details)
+		require.NoError(t, err)
 
-			req, err := http.NewRequest(http.MethodPost, svr.URL+"/helloworld.Greeter/SayHello", bytes.NewReader(data))
-			require.NoError(t, err)
-			req.Header.Set("Content-Type", "application/protobuf")
+		var status spb.Status
+		err = proto.Unmarshal(data, &status)
+		require.NoError(t, err)
 
-			resp, err := client.Do(req)
-			require.NoError(t, err)
+		require.Equal(t, int32(codes.FailedPrecondition), status.Code)
+		require.Equal(t, "cannot do that", status.Message)
+		require.Len(t, status.Details, 1)
 
-			defer resp.Body.Close()
-
-			require.Equal(t, http.StatusPreconditionFailed, resp.StatusCode)
-			require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
-
-			data, err = ioutil.ReadAll(resp.Body)
-			require.NoError(t, err)
-
-			var status spb.Status
-			err = protojson.Unmarshal(data, &status)
-			require.NoError(t, err)
-
-			require.Equal(t, int32(codes.FailedPrecondition), status.Code)
-			require.Equal(t, "cannot do that", status.Message)
-			require.Len(t, status.Details, 1)
-
-			var info errdetails.RequestInfo
-			err = anypb.UnmarshalTo(status.Details[0], &info, newProto.UnmarshalOptions{})
-			require.NoError(t, err)
-			require.Equal(t, "42", info.RequestId)
-		})
-
-	*/
+		var info errdetails.RequestInfo
+		err = anypb.UnmarshalTo(status.Details[0], &info, proto.UnmarshalOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "42", info.RequestId)
+	})
 
 	t.Run("json request", func(t *testing.T) {
 		client := pb.NewGreeterJSONClient(svr.URL, http.DefaultClient)
@@ -150,49 +117,44 @@ func TestHandler(t *testing.T) {
 		require.Equal(t, "hello world", resp.Message)
 	})
 
-	/*
-		t.Run("json error", func(t *testing.T) {
-			client := &http.Client{
-				Transport: &http2.Transport{
-					AllowHTTP: true,
-					DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-						return net.Dial(network, addr)
-					},
-				},
-			}
+	t.Run("json error", func(t *testing.T) {
+		client := pb.NewGreeterJSONClient(svr.URL, http.DefaultClient)
 
-			data, err := protojson.Marshal(&pb.HelloRequest{Name: "universe"})
-			require.NoError(t, err)
+		_, err := client.SayHello(context.Background(), &pb.HelloRequest{Name: "universe"})
+		require.Error(t, err)
 
-			req, err := http.NewRequest(http.MethodPost, svr.URL+"/helloworld.Greeter/SayHello", bytes.NewReader(data))
-			require.NoError(t, err)
-			req.Header.Set("Content-Type", "application/json")
+		twerr, ok := err.(twirp.Error)
+		require.True(t, ok)
 
-			resp, err := client.Do(req)
-			require.NoError(t, err)
+		require.Equal(t, twirp.FailedPrecondition, twerr.Code())
 
-			defer resp.Body.Close()
+		details := twerr.Meta("grpc-status-details-bin")
+		require.NotEmpty(t, details)
 
-			require.Equal(t, http.StatusPreconditionFailed, resp.StatusCode)
-			require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+		data, err := decodeBinHeader(details)
+		require.NoError(t, err)
 
-			data, err = ioutil.ReadAll(resp.Body)
-			require.NoError(t, err)
+		var status spb.Status
+		err = proto.Unmarshal(data, &status)
+		require.NoError(t, err)
 
-			var status spb.Status
-			err = protojson.Unmarshal(data, &status)
-			require.NoError(t, err)
+		require.Equal(t, int32(codes.FailedPrecondition), status.Code)
+		require.Equal(t, "cannot do that", status.Message)
+		require.Len(t, status.Details, 1)
 
-			require.Equal(t, int32(codes.FailedPrecondition), status.Code)
-			require.Equal(t, "cannot do that", status.Message)
-			require.Len(t, status.Details, 1)
+		var info errdetails.RequestInfo
+		err = anypb.UnmarshalTo(status.Details[0], &info, proto.UnmarshalOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "42", info.RequestId)
+	})
+}
 
-			var info errdetails.RequestInfo
-			err = anypb.UnmarshalTo(status.Details[0], &info, newProto.UnmarshalOptions{})
-			require.NoError(t, err)
-			require.Equal(t, "42", info.RequestId)
-		})
-	*/
+func decodeBinHeader(v string) ([]byte, error) {
+	if len(v)%4 == 0 {
+		// Input was padded, or padding was not necessary.
+		return base64.StdEncoding.DecodeString(v)
+	}
+	return base64.RawStdEncoding.DecodeString(v)
 }
 
 // server is used to implement helloworld.GreeterServer.

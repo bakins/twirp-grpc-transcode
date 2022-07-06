@@ -2,7 +2,6 @@ package transcode
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -62,6 +61,9 @@ func New(filename string, next http.Handler) (*Handler, error) {
 	}
 
 	var resolverDesc []*desc.FileDescriptor
+
+	// ensure status is added so we can (un)marshal for details
+	registry.AddKnownType(&spb.Status{})
 
 	for _, d := range descriptors {
 		resolverDesc = append(resolverDesc, d)
@@ -168,16 +170,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	grpcStatus, err := getGrpcStatus(capture.headers)
+	status, err := getTwirpError(capture.headers)
 	if err != nil {
 		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to get grpc-status %w", err))
 		h.writeError(w, twerr)
 		return
 	}
 
-	if codes.Code(grpcStatus.Code) != 0 {
-		twerr := grpcStatusToTwirp(grpcStatus)
-		h.writeError(w, twerr)
+	if status.Code() != twirp.NoError {
+		h.writeError(w, status)
 		return
 	}
 
@@ -227,59 +228,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(output)
 }
 
-func grpcStatusToTwirp(st *spb.Status) twirp.Error {
-	code := twirp.NoError
-	switch codes.Code(st.Code) {
+func grpcStatusToTwirpCode(grpcCode int) twirp.ErrorCode {
+	switch codes.Code(grpcCode) {
+	case codes.OK:
+		return twirp.NoError
 	case codes.Canceled:
-		code = twirp.Canceled
+		return twirp.Canceled
 	case codes.Unknown:
-		code = twirp.Unknown
+		return twirp.Unknown
 	case codes.InvalidArgument:
-		code = twirp.InvalidArgument
+		return twirp.InvalidArgument
 	case codes.DeadlineExceeded:
-		code = twirp.DeadlineExceeded
+		return twirp.DeadlineExceeded
 	case codes.NotFound:
-		code = twirp.NotFound
+		return twirp.NotFound
 	case codes.AlreadyExists:
-		code = twirp.AlreadyExists
+		return twirp.AlreadyExists
 	case codes.PermissionDenied:
-		code = twirp.PermissionDenied
+		return twirp.PermissionDenied
 	case codes.Unauthenticated:
-		code = twirp.Unauthenticated
+		return twirp.Unauthenticated
 	case codes.ResourceExhausted:
-		code = twirp.ResourceExhausted
+		return twirp.ResourceExhausted
 	case codes.FailedPrecondition:
-		code = twirp.FailedPrecondition
+		return twirp.FailedPrecondition
 	case codes.Aborted:
-		code = twirp.Aborted
+		return twirp.Aborted
 	case codes.OutOfRange:
-		code = twirp.OutOfRange
+		return twirp.OutOfRange
 	case codes.Unimplemented:
-		code = twirp.Unimplemented
+		return twirp.Unimplemented
 	case codes.Internal:
-		code = twirp.Internal
+		return twirp.Internal
 	case codes.Unavailable:
-		code = twirp.Unavailable
+		return twirp.Unavailable
 	case codes.DataLoss:
-		code = twirp.DataLoss
+		return twirp.DataLoss
 	default:
-		code = twirp.Internal
+		return twirp.Internal
 	}
-
-	msg := st.Message
-
-	if msg == "" {
-		msg = codes.Code(st.Code).String()
-	}
-
-	twerr := twirp.NewError(code, msg).WithMeta("status", strconv.Itoa(int(st.Code)))
-
-	// TODO: include any details
-
-	return twerr
 }
 
-func getGrpcStatus(headers http.Header) (*spb.Status, error) {
+func getTwirpError(headers http.Header) (twirp.Error, error) {
 	gs := headers.Get("Grpc-Status")
 	if gs == "" {
 		// assume ok - is this reasonable?
@@ -298,39 +288,13 @@ func getGrpcStatus(headers http.Header) (*spb.Status, error) {
 		msg = codes.Code(num).String()
 	}
 
-	s := spb.Status{
-		Code:    int32(num),
-		Message: msg,
+	twerr := twirp.NewError(grpcStatusToTwirpCode(num), msg)
+
+	if details := headers.Get("Grpc-Status-Details-Bin"); details != "" {
+		twerr = twerr.WithMeta("grpc-status-details-bin", details)
 	}
 
-	details := headers.Get("Grpc-Status-Details-Bin")
-	if details == "" {
-		return &s, nil
-	}
-
-	data, err := decodeBinHeader(details)
-	if err != nil {
-		// return what we have
-		return &s, nil
-	}
-
-	var statusProto spb.Status
-	if err := proto.Unmarshal(data, &statusProto); err != nil {
-		// return what we have
-		return &s, nil
-	}
-
-	s.Details = statusProto.Details
-
-	return &s, nil
-}
-
-func decodeBinHeader(v string) ([]byte, error) {
-	if len(v)%4 == 0 {
-		// Input was padded, or padding was not necessary.
-		return base64.StdEncoding.DecodeString(v)
-	}
-	return base64.RawStdEncoding.DecodeString(v)
+	return twerr, nil
 }
 
 func decodeGrpcMessage(msg string) string {
