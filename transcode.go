@@ -11,22 +11,18 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jhump/protoreflect/dynamic"
 	"github.com/twitchtv/twirp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 type Handler struct {
 	next        http.Handler
-	registry    *protoregistry.Files
-	factory     *dynamic.MessageFactory
 	methods     map[string]*rpcMethod
 	marshaler   protojson.MarshalOptions
 	unmarshaler protojson.UnmarshalOptions
@@ -55,9 +51,8 @@ func New(filename string, next http.Handler) (*Handler, error) {
 	}
 
 	h := Handler{
-		registry: files,
-		next:     next,
-		methods:  make(map[string]*rpcMethod),
+		next:    next,
+		methods: make(map[string]*rpcMethod),
 	}
 
 	files.RangeFiles(func(d protoreflect.FileDescriptor) bool {
@@ -88,7 +83,7 @@ func New(filename string, next http.Handler) (*Handler, error) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var isJson bool
+	var isJSON bool
 	ct := strings.ToLower(r.Header.Get("Content-Type"))
 
 	switch {
@@ -97,7 +92,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.next.ServeHTTP(w, r)
 		return
 	case strings.HasPrefix(ct, "application/json"):
-		isJson = true
+		isJSON = true
 	case strings.HasPrefix(ct, "application/protobuf"):
 	default:
 		http.Error(w, "unsupported content-type", http.StatusBadRequest)
@@ -113,10 +108,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	path := strings.TrimPrefix(r.URL.Path, "/twirp")
 
-	if isJson {
+	if isJSON {
 		m, ok := h.methods[path]
 		if !ok {
-			twerr := twirp.Unimplemented.Errorf("transcoding not availible for %s", r.URL.Path)
+			twerr := twirp.Unimplemented.Errorf("transcoding not available for %s", r.URL.Path)
 			h.writeError(w, twerr)
 			return
 		}
@@ -178,16 +173,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if isJson {
+	if isJSON {
 		// we already checked above
 		m, ok := h.methods[path]
 		if !ok {
-			twerr := twirp.Unimplemented.Errorf("transcoding not availible for %s", r.URL.Path)
+			twerr := twirp.Unimplemented.Errorf("transcoding not available for %s", r.URL.Path)
 			h.writeError(w, twerr)
 			return
 		}
 
-		j, err := h.protoToJson(m.output, output)
+		j, err := h.protoToJSON(m.output, output)
 		if err != nil {
 			twerr := twirp.InternalErrorWith(fmt.Errorf("failed to decode response %w", err))
 			h.writeError(w, twerr)
@@ -208,7 +203,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if isJson {
+	if isJSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {
 		w.Header().Set("Content-Type", "application/protobuf")
@@ -300,8 +295,6 @@ func decodeGrpcMessage(msg string) string {
 }
 
 const (
-	spaceByte   = ' '
-	tildeByte   = '~'
 	percentByte = '%'
 )
 
@@ -420,7 +413,7 @@ func (h *Handler) jsonToProto(t protoreflect.MessageType, data []byte) ([]byte, 
 	return proto.Marshal(msg)
 }
 
-func (h *Handler) protoToJson(t protoreflect.MessageType, data []byte) ([]byte, error) {
+func (h *Handler) protoToJSON(t protoreflect.MessageType, data []byte) ([]byte, error) {
 	msg := t.New().Interface()
 
 	if err := proto.Unmarshal(data, msg); err != nil {
