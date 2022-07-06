@@ -1,4 +1,4 @@
-module github.com/bakins/grpc-twirp-transcode
+module github.com/bakins/twirp-grpc-transcode
 
 go 1.18
 
