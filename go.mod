@@ -6,14 +6,14 @@ require (
 	github.com/stretchr/testify v1.7.0
 	github.com/twitchtv/twirp v8.1.2+incompatible
 	golang.org/x/net v0.33.0
-	google.golang.org/genproto v0.0.0-20220621134657-43db42f103f7
-	google.golang.org/grpc v1.47.0
-	google.golang.org/protobuf v1.28.0
+	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1
+	google.golang.org/grpc v1.56.3
+	google.golang.org/protobuf v1.30.0
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.0 // indirect
-	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/kr/pretty v0.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
