@@ -1,7 +1,8 @@
 module github.com/bakins/twirp-grpc-transcode
 
-go 1.18
-toolchain go1.24.1
+
+go 1.24
+
 
 require (
 	github.com/stretchr/testify v1.7.0
