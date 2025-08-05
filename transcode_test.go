@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -25,14 +24,11 @@ import (
 	pb "github.com/bakins/twirp-grpc-transcode/testdata"
 )
 
-// to recreate descriptor set, cd to testdata and run
-// protoc -I . --include_imports --include_source_info -o helloworld.bin helloworld.proto
-// protoc -I .  --go-grpc_out=. --go-grpc_opt=paths=source_relative --go_out=. --go_opt=paths=source_relative  --twirp_opt=paths=source_relative  --twirp_out=. helloworld.proto
-func TestHandler(t *testing.T) {
+func TestTwirpHandler(t *testing.T) {
 	g := grpc.NewServer()
 	pb.RegisterGreeterServer(g, &server{})
 
-	h, err := New(filepath.Join("testdata", "helloworld.bin"), g)
+	h, err := NewTwirpHandler(g)
 	require.NoError(t, err)
 
 	svr := httptest.NewServer(h2c.NewHandler(h, &http2.Server{}))
@@ -43,6 +39,7 @@ func TestHandler(t *testing.T) {
 		conn, err := grpc.Dial(strings.TrimPrefix(svr.URL, "http://"), grpc.WithTransportCredentials(insecure.NewCredentials()))
 		require.NoError(t, err)
 
+		// nolint: errcheck
 		defer conn.Close()
 
 		client := pb.NewGreeterClient(conn)
