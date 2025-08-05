@@ -6,26 +6,33 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/twitchtv/twirp"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-type Handler struct {
-	next        http.Handler
-	methods     map[string]*rpcMethod
-	marshaler   protojson.MarshalOptions
-	unmarshaler protojson.UnmarshalOptions
+type TwirpHandler struct {
+	next               http.Handler
+	mu                 sync.Mutex
+	methods            map[string]map[string]*rpcMethod
+	marshaler          protojson.MarshalOptions
+	unmarshaler        protojson.UnmarshalOptions
+	descriptorResolver DescriptorResolver
+	singleflightGroup  *singleflight.Group
+}
+
+type DescriptorResolver interface {
+	FindDescriptorByName(protoreflect.FullName) (protoreflect.Descriptor, error)
 }
 
 type rpcMethod struct {
@@ -33,56 +40,47 @@ type rpcMethod struct {
 	output protoreflect.MessageType
 }
 
-func New(filename string, next http.Handler) (*Handler, error) {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
+type twirpHandlerOptions struct {
+	descriptorResolver DescriptorResolver
+}
 
-	var fds descriptorpb.FileDescriptorSet
+type TwirpHandlerOption interface {
+	applyHandlerOption(*twirpHandlerOptions)
+}
 
-	if err := proto.Unmarshal(data, &fds); err != nil {
-		return nil, err
-	}
+type twirpHandlerOptionFunc func(*twirpHandlerOptions)
 
-	files, err := protodesc.NewFiles(&fds)
-	if err != nil {
-		return nil, err
-	}
+func (f twirpHandlerOptionFunc) applyHandlerOption(o *twirpHandlerOptions) {
+	f(o)
+}
 
-	h := Handler{
-		next:    next,
-		methods: make(map[string]*rpcMethod),
-	}
-
-	files.RangeFiles(func(d protoreflect.FileDescriptor) bool {
-		services := d.Services()
-		for i := 0; i < services.Len(); i++ {
-			s := services.Get(i)
-
-			methods := s.Methods()
-
-			for j := 0; j < methods.Len(); j++ {
-				m := methods.Get(j)
-
-				rm := rpcMethod{
-					input:  dynamicpb.NewMessage(m.Input()).Type(),
-					output: dynamicpb.NewMessage(m.Output()).Type(),
-				}
-
-				key := "/" + string(s.FullName()) + "/" + string(m.Name())
-
-				h.methods[key] = &rm
-			}
-		}
-
-		return true
+func WithDescriptorResolver(r DescriptorResolver) TwirpHandlerOption {
+	return twirpHandlerOptionFunc(func(o *twirpHandlerOptions) {
+		o.descriptorResolver = r
 	})
+}
+
+// NewTwirpHandler creates a TwirpHandler that transcodes twirp to grpc.
+func NewTwirpHandler(next http.Handler, options ...TwirpHandlerOption) (*TwirpHandler, error) {
+	opts := twirpHandlerOptions{
+		descriptorResolver: protoregistry.GlobalFiles,
+	}
+
+	for _, o := range options {
+		o.applyHandlerOption(&opts)
+	}
+
+	h := TwirpHandler{
+		next:               next,
+		methods:            make(map[string]map[string]*rpcMethod),
+		descriptorResolver: opts.descriptorResolver,
+		singleflightGroup:  &singleflight.Group{},
+	}
 
 	return &h, nil
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *TwirpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var isJSON bool
 	ct := strings.ToLower(r.Header.Get("Content-Type"))
 
@@ -99,7 +97,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to read request %w", err))
 		h.writeError(w, twerr)
@@ -109,8 +107,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/twirp")
 
 	if isJSON {
-		m, ok := h.methods[path]
-		if !ok {
+		m, err := h.getRPCMethod(path)
+		if err != nil {
 			twerr := twirp.Unimplemented.Errorf("transcoding not available for %s", r.URL.Path)
 			h.writeError(w, twerr)
 			return
@@ -135,7 +133,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.ContentLength = int64(len(data))
 	r.Header.Del("Content-Length")
 	r.Header.Set("Content-Type", "application/grpc")
-	r.Body = ioutil.NopCloser(bytes.NewReader(data))
+	r.Body = io.NopCloser(bytes.NewReader(data))
 
 	capture := newResponseWriter()
 
@@ -174,9 +172,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isJSON {
-		// we already checked above
-		m, ok := h.methods[path]
-		if !ok {
+		// we already checked above, so this should always work
+		m, err := h.getRPCMethod(path)
+		if err != nil {
 			twerr := twirp.Unimplemented.Errorf("transcoding not available for %s", r.URL.Path)
 			h.writeError(w, twerr)
 			return
@@ -403,7 +401,7 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	w.status = statusCode
 }
 
-func (h *Handler) jsonToProto(t protoreflect.MessageType, data []byte) ([]byte, error) {
+func (h *TwirpHandler) jsonToProto(t protoreflect.MessageType, data []byte) ([]byte, error) {
 	msg := t.New().Interface()
 
 	if err := h.unmarshaler.Unmarshal(data, msg); err != nil {
@@ -413,7 +411,7 @@ func (h *Handler) jsonToProto(t protoreflect.MessageType, data []byte) ([]byte, 
 	return proto.Marshal(msg)
 }
 
-func (h *Handler) protoToJSON(t protoreflect.MessageType, data []byte) ([]byte, error) {
+func (h *TwirpHandler) protoToJSON(t protoreflect.MessageType, data []byte) ([]byte, error) {
 	msg := t.New().Interface()
 
 	if err := proto.Unmarshal(data, msg); err != nil {
@@ -423,7 +421,7 @@ func (h *Handler) protoToJSON(t protoreflect.MessageType, data []byte) ([]byte, 
 	return h.marshaler.Marshal(msg)
 }
 
-func (h *Handler) writeError(w http.ResponseWriter, twerr twirp.Error) {
+func (h *TwirpHandler) writeError(w http.ResponseWriter, twerr twirp.Error) {
 	respBody := h.marshalErrorToJSON(twerr)
 
 	w.Header().Set("Content-Type", "application/json") // Error responses are always JSON
@@ -442,7 +440,7 @@ type twerrJSON struct {
 	Msg  string            `json:"msg"`
 }
 
-func (h *Handler) marshalErrorToJSON(twerr twirp.Error) []byte {
+func (h *TwirpHandler) marshalErrorToJSON(twerr twirp.Error) []byte {
 	msg := twerr.Msg()
 	if len(msg) > 1e6 {
 		msg = msg[:1e6]
@@ -460,4 +458,76 @@ func (h *Handler) marshalErrorToJSON(twerr twirp.Error) []byte {
 	}
 
 	return buf
+}
+
+func (h *TwirpHandler) getRPCMethod(name string) (*rpcMethod, error) {
+	parts := strings.SplitN(name, "/", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid rpc path %s", name)
+	}
+
+	serviceName := parts[1]
+	methodName := parts[2]
+
+	h.mu.Lock()
+	service, ok := h.methods[name]
+	h.mu.Unlock()
+
+	if !ok {
+		var err error
+		service, err = h.loadService(serviceName)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	method, ok := service[methodName]
+	if !ok {
+		return nil, fmt.Errorf("unable to find method %s for service %s", methodName, serviceName)
+	}
+
+	return method, nil
+}
+
+// this assumes service descriptors do not change during lifetime of handler
+func (h *TwirpHandler) loadService(serviceName string) (map[string]*rpcMethod, error) {
+	// only do one lookup per service at a time
+	res, err, _ := h.singleflightGroup.Do(serviceName, func() (any, error) {
+		desc, err := h.descriptorResolver.FindDescriptorByName(protoreflect.FullName(serviceName))
+		if err != nil {
+			return nil, fmt.Errorf("unable to find descriptor for service %s %w", serviceName, err)
+		}
+
+		serviceDescriptor, ok := desc.(protoreflect.ServiceDescriptor)
+		if !ok {
+			return nil, fmt.Errorf("unexpected descriptor type found for service %s %T", serviceName, desc)
+		}
+
+		methods := serviceDescriptor.Methods()
+
+		service := make(map[string]*rpcMethod, methods.Len())
+
+		h.methods[serviceName] = service
+
+		for i := 0; i < methods.Len(); i++ {
+			method := methods.Get(i)
+
+			r := &rpcMethod{
+				input:  dynamicpb.NewMessageType(method.Input()),
+				output: dynamicpb.NewMessageType(method.Output()),
+			}
+
+			h.mu.Lock()
+			service[string(method.Name())] = r
+			h.mu.Unlock()
+		}
+
+		return service, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return res.(map[string]*rpcMethod), nil
 }

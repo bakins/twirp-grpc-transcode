@@ -2,11 +2,10 @@ module github.com/bakins/twirp-grpc-transcode
 
 
 go 1.24
-
-
 require (
 	github.com/stretchr/testify v1.7.0
 	github.com/twitchtv/twirp v8.1.2+incompatible
+	golang.org/x/sync v0.16.0
 	golang.org/x/net v0.36.0
 	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1
 	google.golang.org/grpc v1.56.3
