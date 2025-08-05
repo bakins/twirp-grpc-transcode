@@ -22,15 +22,14 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// TwirpHandler converts twirp to gRPC
+// TwirpHandler transcodes twirp to gRPC
 type TwirpHandler struct {
-	mu                  sync.Mutex
-	next                http.Handler
-	methods             map[string]*rpcMethod
-	marshaler           protojson.MarshalOptions
-	unmarshaler         protojson.UnmarshalOptions
-	descriptorResolver  DescriptorResolver
-	messageTypeResolver MessageTypeResolver
+	mu                 sync.Mutex
+	next               http.Handler
+	methods            map[string]*rpcMethod
+	marshaler          protojson.MarshalOptions
+	unmarshaler        protojson.UnmarshalOptions
+	descriptorResolver DescriptorResolver
 }
 
 type rpcMethod struct {
@@ -42,13 +41,8 @@ type DescriptorResolver interface {
 	FindDescriptorByName(protoreflect.FullName) (protoreflect.Descriptor, error)
 }
 
-type MessageTypeResolver interface {
-	FindMessageByName(message protoreflect.FullName) (protoreflect.MessageType, error)
-}
-
 type handlerOptions struct {
-	descriptorResolver  DescriptorResolver
-	messageTypeResolver MessageTypeResolver
+	descriptorResolver DescriptorResolver
 }
 
 type HandlerOption interface {
@@ -63,8 +57,7 @@ func (f handlerOptionFunc) applyHandlerOption(o *handlerOptions) {
 
 func NewTwirpHandler(next http.Handler, options ...HandlerOption) (*TwirpHandler, error) {
 	opts := handlerOptions{
-		descriptorResolver:  protoregistry.GlobalFiles,
-		messageTypeResolver: protoregistry.GlobalTypes,
+		descriptorResolver: protoregistry.GlobalFiles,
 	}
 
 	for _, o := range options {
@@ -72,14 +65,30 @@ func NewTwirpHandler(next http.Handler, options ...HandlerOption) (*TwirpHandler
 	}
 
 	h := TwirpHandler{
-		next:                next,
-		methods:             make(map[string]*rpcMethod),
-		descriptorResolver:  opts.descriptorResolver,
-		messageTypeResolver: opts.messageTypeResolver,
+		next:               next,
+		methods:            make(map[string]*rpcMethod),
+		descriptorResolver: opts.descriptorResolver,
 	}
 
 	return &h, nil
 }
+
+// var bufferPool = sync.Pool{
+// 	New: func() any {
+// 		return bufferpool.NewBuffer(nil)
+// 	},
+// }
+
+// func getBuffer() *bufferpool.Buffer {
+// 	b := bufferPool.Get().(*bufferpool.Buffer)
+// 	b.Reset()
+
+// 	return b
+// }
+
+// func releaseBuffer(b *bufferpool.Buffer) {
+// 	bufferPool.Put(b)
+// }
 
 func (h *TwirpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var isJSON bool
@@ -98,53 +107,62 @@ func (h *TwirpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
+	input := &bytes.Buffer{}
+
+	if r.ContentLength > 0 {
+		input.Grow(int(r.ContentLength))
+	}
+
+	if _, err := io.Copy(input, r.Body); err != nil {
 		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to read request %w", err))
 		h.writeError(w, twerr)
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/twirp")
-
-	rpcName := "/" + strings.TrimPrefix("/twirp/", r.URL.Path)
+	rpcName := "/" + strings.TrimPrefix(r.URL.Path, "/twirp/")
 
 	if isJSON {
 		m, err := h.getRPCMethod(rpcName)
 		if err != nil {
-			twerr := twirp.Unimplemented.Errorf("transcoding not available for %s", r.URL.Path)
+			twerr := twirp.Unimplemented.Errorf("transcoding not available for %s", rpcName)
 			twerr = twirp.WrapError(twerr, err)
 			h.writeError(w, twerr)
 			return
 		}
 
-		p, err := h.jsonToProto(m.input, data)
+		p, err := h.jsonToProto(m.input, input.Bytes())
 		if err != nil {
 			twerr := twirp.InvalidArgument.Errorf("the request could not be decoded %s", err.Error())
 			h.writeError(w, twerr)
 			return
 		}
 
-		data = p
+		input = bytes.NewBuffer(p)
 	}
 
-	data = addFraming(data)
+	input, err := addFraming(input)
+	if err != nil {
+		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to prepare request %w", err))
+		h.writeError(w, twerr)
+		return
+	}
 
 	r = r.Clone(r.Context())
-	r.URL.Path = path
+	r.URL.Path = rpcName
 	r.ProtoMajor = 2
 	r.ProtoMinor = 0
-	r.ContentLength = int64(len(data))
+	r.ContentLength = int64(input.Len())
 	r.Header.Del("Content-Length")
 	r.Header.Set("Content-Type", "application/grpc")
-	r.Body = io.NopCloser(bytes.NewReader(data))
+	// need to remove any other grpc related headers?
+	// set grpc-timeout?
+	r.Body = io.NopCloser(input)
 
 	capture := newResponseWriter()
 
 	h.next.ServeHTTP(capture, r)
 
 	if statusCode := capture.getStatus(); statusCode != http.StatusOK {
-		fmt.Println(capture.body.String())
 		twerr := twirp.Internal.Errorf("error from intermediary with HTTP status code %d", statusCode)
 		h.writeError(w, twerr)
 		return
@@ -168,7 +186,8 @@ func (h *TwirpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	output, err := removeFraming(&capture.body)
+	// we can't pool output reliably, as middleware may hold onto references to response body.
+	output, err := removeFraming(capture.body, capture.headers)
 	if err != nil {
 		twerr := twirp.InternalErrorWith(fmt.Errorf("failed to remove grpc message framing %w", err))
 		h.writeError(w, twerr)
@@ -185,19 +204,19 @@ func (h *TwirpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		j, err := h.protoToJSON(m.output, output)
+		j, err := h.protoToJSON(m.output, output.Bytes())
 		if err != nil {
 			twerr := twirp.InternalErrorWith(fmt.Errorf("failed to decode response %w", err))
 			h.writeError(w, twerr)
 			return
 		}
 
-		output = j
+		output = bytes.NewBuffer(j)
 	}
 
 	for k, vv := range capture.headers {
 		switch k {
-		case "Grpc-Status", "Grpc-Message", "Grpc-Status-Details-Bin", "Content-Type", "Trailer":
+		case "Grpc-Status", "Grpc-Message", "Grpc-Encoding", "Grpc-Status-Details-Bin", "Content-Type", "Trailer":
 			// skip
 		default:
 			for _, v := range vv {
@@ -212,7 +231,7 @@ func (h *TwirpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/protobuf")
 	}
 
-	_, _ = w.Write(output)
+	_, _ = io.Copy(w, output)
 }
 
 func grpcStatusToTwirpCode(grpcCode int) twirp.ErrorCode {
@@ -321,26 +340,34 @@ func decodeGrpcMessageUnchecked(msg string) string {
 	return buf.String()
 }
 
-func addFraming(in []byte) []byte {
-	l := len(in)
-	out := make([]byte, 5+l)
-	binary.BigEndian.PutUint32(out[1:], uint32(l))
+func addFraming(in *bytes.Buffer) (*bytes.Buffer, error) {
+	l := in.Len()
 
-	if l > 0 {
-		copy(out[5:], in)
+	out := &bytes.Buffer{}
+	out.Grow(5 + l)
+
+	prefix := []byte{0, 0, 0, 0, 0}
+
+	binary.BigEndian.PutUint32(prefix[1:], uint32(l))
+
+	if _, err := out.Write(prefix); err != nil {
+		return nil, err
 	}
 
-	return out
+	if _, err := io.Copy(out, in); err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }
 
-// need to disable compression for now???
-func removeFraming(r io.Reader, headers http.Header) ([]byte, error) {
+func removeFraming(r *bytes.Buffer, headers http.Header) (*bytes.Buffer, error) {
 	prefix := []byte{0, 0, 0, 0, 0}
 
 	if n, err := io.ReadFull(r, prefix); err != nil {
 		// empty body is valid for proto
 		if n == 0 && err == io.EOF {
-			return []byte{}, nil
+			return nil, nil
 		}
 
 		return nil, err
@@ -349,9 +376,11 @@ func removeFraming(r io.Reader, headers http.Header) ([]byte, error) {
 	length := binary.BigEndian.Uint32(prefix[1:])
 
 	// TODO: check for too large of a message?
-	out := make([]byte, length)
+	out := &bytes.Buffer{}
 
-	if _, err := io.ReadFull(r, out); err != nil {
+	out.Grow(int(length))
+
+	if _, err := io.CopyN(out, r, int64(length)); err != nil {
 		return nil, err
 	}
 
@@ -369,19 +398,30 @@ func removeFraming(r io.Reader, headers http.Header) ([]byte, error) {
 		return nil, fmt.Errorf("compressor %s is not supported", name)
 	}
 
-	compressor.Decompress(bytes.NewBuffer(out))
+	rdr, err := compressor.Decompress(out)
+	if err != nil {
+		return nil, err
+	}
+
+	out.Reset()
+	if _, err := io.Copy(out, rdr); err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }
 
 func newResponseWriter() *responseWriter {
 	w := responseWriter{
 		headers: make(http.Header, 3),
+		body:    &bytes.Buffer{},
 	}
 
 	return &w
 }
 
 type responseWriter struct {
-	body    bytes.Buffer
+	body    *bytes.Buffer
 	headers http.Header
 	status  int
 }
@@ -453,19 +493,9 @@ func (h *TwirpHandler) getRPCMethod(name string) (*rpcMethod, error) {
 		return nil, fmt.Errorf("unable to find method %s for service %s", methodName, serviceName)
 	}
 
-	inputType, err := h.messageTypeResolver.FindMessageByName(method.Input().FullName())
-	if err != nil {
-		inputType = dynamicpb.NewMessageType(method.Input())
-	}
-
-	outputType, err := h.messageTypeResolver.FindMessageByName(method.Output().FullName())
-	if err != nil {
-		outputType = dynamicpb.NewMessageType(method.Output())
-	}
-
 	r := &rpcMethod{
-		input:  inputType,
-		output: outputType,
+		input:  dynamicpb.NewMessageType(method.Input()),
+		output: dynamicpb.NewMessageType(method.Output()),
 	}
 
 	h.methods[name] = r
@@ -531,3 +561,87 @@ func (h *TwirpHandler) marshalErrorToJSON(twerr twirp.Error) []byte {
 
 	return buf
 }
+
+/*
+type grpcTranscodeHandler struct {
+	inputType  protoreflect.MessageType
+	outputType protoreflect.MessageType
+	client     *connect.Client[bytes.Buffer, bytes.Buffer]
+	next       http.Client
+}
+
+// need to create a client that just forwards to next handler
+
+func (g *grpcTranscodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// TODO: pool the buffers?
+	input := bytes.NewBuffer([]byte{})
+
+	if r.ContentLength > 0 {
+		input.Grow(int(r.ContentLength))
+	}
+
+	if _, err := io.Copy(input, r.Body); err != nil {
+		///
+	}
+
+	// TODO: handle json->protobuf
+
+	request := connect.NewRequest(input)
+	response, err := g.client.CallUnary(
+		r.Context(),
+		request,
+	)
+	if err != nil {
+		// convert connect client errors to twirp errors
+	}
+
+	// clean this up
+	for k, vv := range response.Header() {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+
+	// TODO: json if needed
+
+	_, _ = io.Copy(w, response.Msg)
+}
+
+type bufferCodec struct{}
+
+func (bufferCodec) Name() string {
+	return "proto"
+}
+
+func (bufferCodec) Marshal(input any) ([]byte, error) {
+	b, ok := input.(*bytes.Buffer)
+	if ok {
+		return b.Bytes(), nil
+	}
+
+	p, ok := input.(proto.Message)
+	if ok {
+		return proto.Marshal(p)
+	}
+
+	return nil, fmt.Errorf("unsupported marshal type %T", input)
+}
+
+func (bufferCodec) Unmarshal(data []byte, input any) error {
+	b, ok := input.(*bytes.Buffer)
+	if ok {
+		_, err := b.Write(data)
+		return err
+	}
+
+	p, ok := input.(proto.Message)
+	if ok {
+		return proto.Unmarshal(data, p)
+	}
+
+	return fmt.Errorf("unsupported unmarshal type %T", input)
+}
+
+*/

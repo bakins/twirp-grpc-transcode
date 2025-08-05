@@ -1,10 +1,9 @@
 module github.com/bakins/twirp-grpc-transcode
 
-go 1.21
-
-toolchain go1.23.5
+go 1.23
 
 require (
+	github.com/libp2p/go-buffer-pool v0.1.0
 	github.com/stretchr/testify v1.7.0
 	github.com/twitchtv/twirp v8.1.2+incompatible
 	golang.org/x/net v0.23.0
@@ -14,9 +13,9 @@ require (
 )
 
 require (
-	connectrpc.com/connect v1.18.1 // indirect
 	github.com/davecgh/go-spew v1.1.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/kr/pretty v0.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
