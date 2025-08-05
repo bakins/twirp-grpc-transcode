@@ -531,3 +531,11 @@ func (h *TwirpHandler) loadService(serviceName string) (map[string]*rpcMethod, e
 
 	return res.(map[string]*rpcMethod), nil
 }
+
+// PreloadService resolves a service and its methods. This avoids
+// lazily loading it at runtime.
+// This will overwrite any previously loaded version of the service.
+func (h *TwirpHandler) PreloadService(serviceName string) error {
+	_, err := h.loadService(serviceName)
+	return err
+}
